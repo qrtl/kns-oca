@@ -7,7 +7,7 @@
     "author": "Quartile, Odoo Community Association (OCA)",
     "website": "https://github.com/OCA/l10n-japan",
     "license": "AGPL-3",
-    "depends": ["sale", "account_billing", "report_alternative_layout"],
+    "depends": ["account_billing", "report_alternative_layout"],
     "data": [
         "reports/report_summary_invoice_templates.xml",
         "reports/summary_invoice_reports.xml",
