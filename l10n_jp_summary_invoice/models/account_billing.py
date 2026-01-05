@@ -100,7 +100,11 @@ class AccountBilling(models.Model):
         calculation to Odoo's standard `account.move._compute_tax_totals()`.
         """
         for bill in self:
-            bill.tax_totals = False
+            bill.tax_totals = self.env["account.tax"]._get_tax_totals_summary(
+                base_lines=[],
+                currency=bill.currency_id or bill.company_id.currency_id,
+                company=bill.company_id,
+            )
             bill.amount_untaxed = 0.0
             bill.amount_tax = 0.0
             bill.amount_total = 0.0
