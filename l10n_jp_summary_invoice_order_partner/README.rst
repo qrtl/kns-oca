@@ -53,13 +53,6 @@ following settings as necessary:
    shipping partner will be shown for each invoice in the summary
    invoice.
 
-Known issues / Roadmap
-======================
-
-This module cannot display the sale order partner and the sale order
-shipping address for each invoice line, nor at the summary invoice
-level.
-
 Bug Tracker
 ===========
 
