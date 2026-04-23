@@ -90,16 +90,22 @@ class TestAccountBilling(TransactionCase):
         currency_id=None,
         partner=None,
         account_id=None,
+        invoice_date=None,
+        invoice_date_due=None,
     ):
         """Returns an open invoice"""
+        inv_date = invoice_date or fields.Date.context_today(self.env.user)
         invoice = self.invoice_model.create(
             {
                 "partner_id": partner or self.partner_agrolait.id,
                 "currency_id": currency_id or self.currency_eur_id,
                 "move_type": invoice_type,
-                "invoice_date": fields.Date.context_today(self.env.user),
-                "date": fields.Date.context_today(self.env.user),
-                "invoice_payment_term_id": self.payment_term.id,
+                "invoice_date": inv_date,
+                "date": inv_date,
+                "invoice_date_due": invoice_date_due,
+                "invoice_payment_term_id": (
+                    False if invoice_date_due else self.payment_term.id
+                ),
                 "invoice_line_ids": [
                     Command.create(
                         {
@@ -154,6 +160,8 @@ class TestAccountBilling(TransactionCase):
         action = invoices.action_create_billing()
         customer_billing1 = self.billing_model.browse(action["res_id"])
         self.assertEqual(customer_billing1.state, "draft")
+        # In case other modules change the default value of threshold_date_type
+        customer_billing1.threshold_date_type = "invoice_date_due"
         # Threshold Date error
         with self.assertRaises(ValidationError):
             customer_billing1.validate_billing()
@@ -268,3 +276,55 @@ class TestAccountBilling(TransactionCase):
         customer_billing.action_cancel()
         self.inv_1.button_draft()
         self.assertEqual(self.inv_1.state, "draft")
+
+    def test_account_billing_currency(self):
+        self.assertEqual(self.env.company.currency_id.id, self.currency_usd_id)
+        inv_1 = self.create_invoice(
+            amount=100,
+            currency_id=self.currency_eur_id,
+            partner=self.partner_id.id,
+        )
+        inv_2 = inv_1.copy()
+        inv_2.invoice_date = fields.Date.today()
+        inv_2.action_post()
+        invoices = inv_1 + inv_2
+        action = invoices.action_create_billing()
+        customer_billing = self.billing_model.browse(action["res_id"])
+        self.assertEqual(customer_billing.currency_id.id, self.currency_eur_id)
+
+    def test_sort_billing_lines(self):
+        inv_a = self.create_invoice(
+            amount=100,
+            invoice_date=fields.Date.from_string("2024-04-03"),
+            invoice_date_due=fields.Date.from_string("2024-05-04"),
+        )
+        inv_b = self.create_invoice(
+            amount=200,
+            invoice_date=fields.Date.from_string("2024-04-01"),
+            invoice_date_due=fields.Date.from_string("2024-05-02"),
+        )
+        inv_c = self.create_invoice(
+            amount=300,
+            invoice_date=fields.Date.from_string("2024-04-02"),
+            invoice_date_due=fields.Date.from_string("2024-05-01"),
+        )
+        inv_d = self.create_invoice(
+            amount=400,
+            invoice_date=fields.Date.from_string("2024-04-02"),
+            invoice_date_due=fields.Date.from_string("2024-05-01"),
+        )
+        invoices = inv_a + inv_b + inv_c + inv_d
+        action = invoices.action_create_billing()
+        billing = self.billing_model.browse(action["res_id"])
+        self.assertEqual(
+            billing.billing_line_ids.mapped("move_id").ids,
+            (inv_c + inv_d + inv_b + inv_a).ids,
+        )
+
+        # Onchange triggers re-sort
+        billing.threshold_date_type = "invoice_date"
+        billing._onchange_threshold_date_type()
+        self.assertEqual(
+            billing.billing_line_ids.mapped("move_id").ids,
+            (inv_b + inv_c + inv_d + inv_a).ids,
+        )
