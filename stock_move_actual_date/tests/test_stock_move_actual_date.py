@@ -1,7 +1,7 @@
 # Copyright 2025 Quartile (https://www.quartile.co)
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 
-from datetime import date
+from datetime import date, datetime
 
 from freezegun import freeze_time
 
@@ -40,7 +40,7 @@ class TestStockMoveActualDate(TransactionCase):
         cls.supplier_location = cls.env.ref("stock.stock_location_suppliers")
         cls.stock_location = cls.env.ref("stock.stock_location_stock")
 
-    def create_picking(self, actual_date=False):
+    def create_picking(self, actual_date=False, is_done=True):
         receipt = self.env["stock.picking"].create(
             {
                 "location_id": self.supplier_location.id,
@@ -72,8 +72,9 @@ class TestStockMoveActualDate(TransactionCase):
             }
         )
         receipt.move_ids._action_confirm()
-        receipt.move_ids.picked = True
-        receipt.move_ids._action_done()
+        if is_done:
+            receipt.move_ids.picked = True
+            receipt.move_ids._action_done()
         return receipt, receipt.move_ids
 
     def create_scrap(self, receipt, actual_date=False):
@@ -177,3 +178,50 @@ class TestStockMoveActualDate(TransactionCase):
             date(2025, 3, 10),
             "SVL accounting date should match the move actual date.",
         )
+
+    def test_open_qty_at_actual_date(self):
+        self.env.user.tz = "Asia/Tokyo"
+        _, _ = self.create_picking(date(2025, 7, 1))
+        wizard = self.env["stock.quantity.history"].create(
+            # 2025-06-30 23:00:00 JST
+            {"inventory_datetime": datetime(2025, 6, 30, 14, 0, 0)}
+        )
+        action = wizard.open_at_date()
+        self.assertEqual(
+            self.product_1.with_context(**action["context"]).qty_available, 0.0
+        )
+        self.product_1.invalidate_recordset()
+        action = wizard.open_qty_at_actual_date()
+        self.assertEqual(
+            self.product_1.with_context(**action["context"]).qty_available, 0.0
+        )
+        wizard = self.env["stock.quantity.history"].create(
+            # 2025-07-01 00:00:00 JST
+            {"inventory_datetime": datetime(2025, 6, 30, 15, 0, 0)}
+        )
+        action = wizard.open_at_date()
+        self.assertEqual(
+            self.product_1.with_context(**action["context"]).qty_available, 0.0
+        )
+        self.product_1.invalidate_recordset()
+        action = wizard.open_qty_at_actual_date()
+        self.assertEqual(
+            self.product_1.with_context(**action["context"]).qty_available, 10.0
+        )
+
+    def test_backorder_picking_actual_date(self):
+        picking, move = self.create_picking(date(2025, 3, 10), is_done=False)
+        move.move_line_ids.quantity = 5.0
+        backorder_wizard_values = picking.button_validate()
+        backorder_wizard = (
+            self.env[(backorder_wizard_values.get("res_model"))]
+            .browse(backorder_wizard_values.get("res_id"))
+            .with_context(**backorder_wizard_values["context"])
+        )
+        backorder_wizard.process()
+        backorder = self.env["stock.picking"].search(
+            [("backorder_id", "=", picking.id)], limit=1
+        )
+        self.assertTrue(backorder, "Backorder picking should be created.")
+        self.assertFalse(backorder.actual_date)
+        self.assertFalse(backorder.move_ids.actual_date_source)
