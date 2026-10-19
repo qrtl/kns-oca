@@ -76,7 +76,11 @@
                                 <span t-esc="order.client_order_ref" />
                             </td>
                             <td name="td_description">
-                                <span t-field="line.name" />
+                                <span
+                                    t-if="line.name"
+                                    t-field="line.name"
+                                    t-options="{'widget': 'text'}"
+                                />
                             </td>
                             <td name="td_quantity" class="text-end">
                                 <span t-field="line.signed_quantity" />
@@ -147,6 +151,9 @@
                         >Cancelled Summary Invoice</span>
                         <span t-field="o.name" />
                     </h2>
+                    <h4 t-if="o.report_subtitle" class="mt-1 fw-normal">
+                        <span t-field="o.report_subtitle" />
+                    </h4>
                     <div t-if="o.company_id.summary_invoice_remark">
                         <span t-field="o.company_id.summary_invoice_remark" />
                     </div>
