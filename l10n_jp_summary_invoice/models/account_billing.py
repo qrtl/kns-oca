@@ -20,23 +20,7 @@ class AccountBilling(models.Model):
     tax_totals = fields.Json(
         string="Billing Totals",
         compute="_compute_tax_totals",
-        store=True,
         exportable=False,
-    )
-    amount_untaxed = fields.Monetary(
-        string="Untaxed Amount",
-        compute="_compute_tax_totals",
-        store=True,
-    )
-    amount_tax = fields.Monetary(
-        string="Tax Amount",
-        compute="_compute_tax_totals",
-        store=True,
-    )
-    amount_total = fields.Monetary(
-        string="Total Amount",
-        compute="_compute_tax_totals",
-        store=True,
     )
     tax_adjustment_entry_id = fields.Many2one("account.move")
     company_partner_id = fields.Many2one(
@@ -48,6 +32,9 @@ class AccountBilling(models.Model):
         domain="[('partner_id', '=', company_partner_id)]",
         help="If not specified, the first bank account linked to the company will show "
         "in the report.",
+    )
+    report_subtitle = fields.Char(
+        help="Subtitle to be printed below the title of the summary invoice report.",
     )
 
     @api.constrains("state", "billing_line_ids")
@@ -98,6 +85,11 @@ class AccountBilling(models.Model):
         """Compute `tax_totals` by building an in-memory draft invoice that reuses all
         the invoice lines referenced by the billing lines, and then delegating the tax
         calculation to Odoo's standard `account.move._compute_tax_totals()`.
+
+        As in `account.move`, the field is not stored: the labels it holds (e.g.
+        "Untaxed Amount", tax group names) are translated when the value is built, so
+        it has to be built in the language of the reader (i.e. the partner's one in the
+        report).
         """
         for bill in self:
             bill.tax_totals = self.env["account.tax"]._get_tax_totals_summary(
@@ -105,9 +97,6 @@ class AccountBilling(models.Model):
                 currency=bill.currency_id or bill.company_id.currency_id,
                 company=bill.company_id,
             )
-            bill.amount_untaxed = 0.0
-            bill.amount_tax = 0.0
-            bill.amount_total = 0.0
             src_moves = bill.billing_line_ids.move_id
             if not src_moves:
                 continue
@@ -132,10 +121,16 @@ class AccountBilling(models.Model):
             )
             dummy_move._compute_tax_totals()
             bill.tax_totals = dummy_move.tax_totals
-            if bill.tax_totals:
-                bill.amount_untaxed = bill.tax_totals.get("base_amount_currency", 0.0)
-                bill.amount_total = bill.tax_totals.get("total_amount_currency", 0.0)
-                bill.amount_tax = bill.amount_total - bill.amount_untaxed
+
+    @api.depends("billing_line_ids", "partner_id", "currency_id")
+    def _compute_amount(self):
+        super()._compute_amount()
+        for bill in self:
+            tax_totals = bill.tax_totals or {}
+            bill.amount_untaxed = tax_totals.get("base_amount_currency", 0.0)
+            bill.amount_total = tax_totals.get("total_amount_currency", 0.0)
+            bill.amount_tax = bill.amount_total - bill.amount_untaxed
+        return
 
     def _update_remit_to_bank_id(self):
         for rec in self:
@@ -172,7 +167,7 @@ class AccountBilling(models.Model):
         associated with billing lines.
         """
         self.ensure_one()
-        tax_amount_groups = self.env["account.move.line"].read_group(
+        tax_amount_groups_tuples = self.env["account.move.line"]._read_group(
             domain=[
                 ("move_id", "in", self.billing_line_ids.move_id.ids),
                 "|",
@@ -181,16 +176,23 @@ class AccountBilling(models.Model):
                 ("display_type", "=", "rounding"),
                 ("tax_repartition_line_id", "!=", False),
             ],
-            fields=["tax_group_id", "balance"],
             groupby=["tax_group_id"],
+            aggregates=["amount_currency:sum"],
         )
+        tax_amount_groups = [
+            {
+                "tax_group_id": (group.id, group.name),
+                "amount_currency": amount_sum,
+            }
+            for group, amount_sum in tax_amount_groups_tuples
+        ]
         return tax_amount_groups
 
     def _get_inv_line_account_id(self):
         self.ensure_one()
         return self.env["account.account"]._get_most_frequent_account_for_partner(
             company_id=self.company_id.id,
-            partner_id=self.partner_id.id,
+            partner_id=self.partner_id.commercial_partner_id.id,
             move_type="out_invoice",
         )
 
@@ -205,22 +207,23 @@ class AccountBilling(models.Model):
             for subtotal in tax_totals.get("subtotals", []):
                 for group in subtotal.get("tax_groups", []):
                     tax_group_id = group.get("id")
-                    tax_amount = group.get("tax_amount", 0.0)
+                    tax_amount = group.get("tax_amount_currency", 0.0)
                     tax_group_amount_dict[tax_group_id] = tax_amount * -1
             tax_amount_groups_invoices = rec._get_tax_amount_groups_from_invoices()
             tax_group_diff_dict = {}
             for tax_amount_group in tax_amount_groups_invoices:
                 tax_group_id = tax_amount_group["tax_group_id"][0]
-                tax_amount_invoices = tax_amount_group["balance"]
+                tax_amount_invoices = tax_amount_group["amount_currency"]
                 tax_amount_bill = tax_group_amount_dict.get(tax_group_id, 0)
                 tax_diff = tax_amount_invoices - tax_amount_bill
-                if tax_diff:
+                if not rec.currency_id.is_zero(tax_diff):
                     tax_group_diff_dict[tax_group_id] = tax_diff
             if not tax_group_diff_dict:
                 continue
             invoice_vals = {
                 "move_type": "out_invoice",
                 "partner_id": rec.partner_id.id,
+                "currency_id": rec.currency_id.id,
                 "date": rec.date,
                 "invoice_origin": rec.name,
                 "ref": f"Tax adjustment for {rec.name}",
