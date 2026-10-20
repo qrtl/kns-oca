@@ -7,7 +7,6 @@ import logging
 from contextlib import contextmanager
 
 from odoo import api, fields, models
-from odoo.tools.safe_eval import safe_eval
 
 _logger = logging.getLogger(__name__)
 
@@ -135,7 +134,7 @@ class AutomaticWorkflowJob(models.Model):
             and "customer"
             or "supplier"
         )
-        return {
+        res = {
             "reconciled_invoice_ids": [(6, 0, invoice.ids)],
             "amount": invoice.amount_residual,
             "partner_id": invoice.partner_id.id,
@@ -143,6 +142,23 @@ class AutomaticWorkflowJob(models.Model):
             "date": fields.Date.context_today(self),
             "currency_id": invoice.currency_id.id,
         }
+        property_payment_journal_id = (
+            invoice.workflow_process_id.property_payment_journal_id
+        )
+        if property_payment_journal_id:
+            res["journal_id"] = property_payment_journal_id.id
+        return res
+
+    def _do_register_payment(self, invoice, domain_filter):
+        """Register a payment for an invoice, filter ensure no duplication"""
+        if not self.env["account.move"].search_count(
+            [("id", "=", invoice.id)] + domain_filter
+        ):
+            return f"{invoice.display_name} {invoice} job bypassed"
+        payment = self._register_payment_invoice(invoice)
+        if not payment:
+            return f"{invoice.display_name} {invoice} job bypassed: nothing to pay"
+        return f"{invoice.display_name} {invoice} register payment successfully"
 
     @api.model
     def _register_payments(self, payment_filter):
@@ -151,17 +167,34 @@ class AutomaticWorkflowJob(models.Model):
         _logger.debug("Invoices to Register Payment: %s", invoices.ids)
         for invoice in invoices:
             with savepoint(self.env.cr):
-                self._register_payment_invoice(invoice)
+                self._do_register_payment(
+                    invoice.with_company(invoice.company_id), payment_filter
+                )
         return
 
     def _register_payment_invoice(self, invoice):
+        self = self.with_company(invoice.company_id)
+        # Never create a payment that settles nothing. Such a payment leaves
+        # the invoice exactly as it found it, so the invoice keeps matching
+        # the payment filter and a new payment is created on every run of the
+        # cron, forever.
+        if invoice.currency_id.is_zero(invoice.amount_residual):
+            _logger.debug(
+                "Skipping payment registration for %s: residual amount is zero.",
+                invoice.display_name,
+            )
+            return self.env["account.payment"]
         payment = self.env["account.payment"].create(
             self._prepare_dict_account_payment(invoice)
         )
         payment.action_post()
 
         domain = [
-            ("account_type", "in", ("asset_receivable", "liability_payable")),
+            (
+                "account_type",
+                "in",
+                self.env["account.payment"]._get_valid_payment_account_types(),
+            ),
             ("reconciled", "=", False),
         ]
         payment_lines = payment.move_id.line_ids.filtered_domain(domain)
@@ -170,6 +203,7 @@ class AutomaticWorkflowJob(models.Model):
             (payment_lines + lines).filtered_domain(
                 [("account_id", "=", account.id), ("reconciled", "=", False)]
             ).reconcile()
+        lines.move_id.matched_payment_ids += payment
         return payment
 
     @api.model
@@ -186,27 +220,27 @@ class AutomaticWorkflowJob(models.Model):
             self.with_context(
                 send_order_confirmation_mail=sale_workflow.send_order_confirmation_mail
             )._validate_sale_orders(
-                safe_eval(sale_workflow.order_filter_id.domain) + workflow_domain
+                sale_workflow.order_filter_id._get_eval_domain() + workflow_domain
             )
         self._handle_pickings(sale_workflow)
         if sale_workflow.create_invoice:
             self._create_invoices(
-                safe_eval(sale_workflow.create_invoice_filter_id.domain)
+                sale_workflow.create_invoice_filter_id._get_eval_domain()
                 + workflow_domain
             )
         if sale_workflow.validate_invoice:
             self._validate_invoices(
-                safe_eval(sale_workflow.validate_invoice_filter_id.domain)
+                sale_workflow.validate_invoice_filter_id._get_eval_domain()
                 + workflow_domain
             )
         if sale_workflow.sale_done:
             self._sale_done(
-                safe_eval(sale_workflow.sale_done_filter_id.domain) + workflow_domain
+                sale_workflow.sale_done_filter_id._get_eval_domain() + workflow_domain
             )
 
         if sale_workflow.register_payment:
             self._register_payments(
-                safe_eval(sale_workflow.payment_filter_id.domain) + workflow_domain
+                sale_workflow.payment_filter_id._get_eval_domain() + workflow_domain
             )
 
     @api.model
